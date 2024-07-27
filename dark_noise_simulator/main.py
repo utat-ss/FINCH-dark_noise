@@ -14,7 +14,7 @@ data_img = data[:,:,100]
 
 #step 1
 #computing photon shot noise
-num_photons = 490 #assumption
+num_photons = 500 #assumption
 #num_pixels = 256 #original
 num_pixels  = 512 #changed to fit datacube 
 
@@ -88,8 +88,16 @@ quantum_efficiency = 0.6 #given = >60 ???
 # Round the result to ensure that we have a discrete number of electrons
 electrons = np.round(quantum_efficiency * shot_noise)
 
+affected_data_2 = np.copy(affected_data)
+dim = np.shape(affected_data_2)
+for i in range(0, dim[0]):
+  for j in range(0, dim[1]):
+    if electrons[i,j] > 512:
+      affected_data_2[i,j] = 0
+
 fig, (ax0, ax1) = plt.subplots(ncols=2)
 img0 = ax0.imshow(shot_noise, vmin=200, vmax=600)
+image0 = ax0.imshow(affected_data) #added
 ax0.set_xticks([])
 ax0.set_yticks([])
 ax0.set_title('Photons')
@@ -100,6 +108,7 @@ cb0 = plt.colorbar(img0, cax=cax)
 cb0.set_ticks([])
 
 img1 = ax1.imshow(electrons, vmin=200, vmax=600)
+image1 = ax1.imshow(affected_data_2) #added
 ax1.set_xticks([])
 ax1.set_yticks([])
 ax1.set_title('Electrons')
@@ -115,8 +124,16 @@ plt.show()
 dark_noise = 2.29 # electrons # also assumption - need exact spec
 electrons_out = np.round(rs.normal(scale=dark_noise, size=electrons.shape) + electrons)
 
+affected_data_3 = np.copy(affected_data_2)
+dim = np.shape(affected_data_3)
+for i in range(0, dim[0]):
+  for j in range(0, dim[1]):
+    if electrons_out[i,j] > 512:
+      affected_data_3[i,j] = 0
+
 fig, (ax0, ax1) = plt.subplots(ncols=2)
 img0 = ax0.imshow(electrons, vmin=250, vmax=450)
+image0 = ax0.imshow(affected_data_2) #added
 ax0.set_xticks([])
 ax0.set_yticks([])
 ax0.set_title('Electrons In')
@@ -127,6 +144,7 @@ cb0 = plt.colorbar(img0, cax=cax)
 cb0.set_ticks([])
 
 img1 = ax1.imshow(electrons_out, vmin=250, vmax=450)
+image1 = ax1.imshow(affected_data_3) #added
 ax1.set_xticks([])
 ax1.set_yticks([])
 ax1.set_title('Electrons Out')
