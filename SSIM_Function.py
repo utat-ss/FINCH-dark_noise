@@ -29,6 +29,8 @@ def compute_ssim_tf(image_path1, image_path2):
     img1_tensor = preprocess_grayscale_image(img1)
     img2_tensor = preprocess_grayscale_image(img2)
 
+
+    #Testing images
     ssim_score = tf.image.ssim(img1_tensor, img2_tensor, max_val=255.0)
     return float(ssim_score.numpy()) 
 
