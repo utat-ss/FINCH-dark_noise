@@ -2,6 +2,10 @@ import tensorflow as tf
 import cv2
 import os
 
+# used python 3.11
+#used tensorflow 2.14.0
+#used opcencev 4.7.0
+
 def preprocess_grayscale_image(image):
     tensor = tf.convert_to_tensor(image, dtype=tf.float32)
     return tf.expand_dims(tf.expand_dims(tensor, axis=0), axis=-1)
@@ -26,13 +30,13 @@ def compute_ssim_tf(image_path1, image_path2):
     img2_tensor = preprocess_grayscale_image(img2)
 
     ssim_score = tf.image.ssim(img1_tensor, img2_tensor, max_val=255.0)
-    return float(ssim_score.numpy())  # Fixed: removed the [0] indexing
+    return float(ssim_score.numpy()) 
 
 if __name__ == "__main__":
     print("Current working directory:", os.getcwd())
 
     try:
-        score = compute_ssim_tf("noisy_image.jpeg", "denoised_image.jpeg")  # Fixed: typo corrected
+        score = compute_ssim_tf("noisy_image.jpeg", "denoised_image.jpeg")  
         print("TensorFlow SSIM Score:", score)
     except Exception as e:
         print("Error:", e)
