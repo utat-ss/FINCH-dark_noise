@@ -2,7 +2,7 @@ import tensorflow as tf
 import cv2
 import os
 
-# used python 3.11
+#used python 3.11
 #used tensorflow 2.14.0
 #used opcencev 4.7.0
 
