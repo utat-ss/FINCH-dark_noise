@@ -1,206 +1,345 @@
-# still need the actual numbers for photons per pixel & the number of pixels
-import scipy
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
-from numpy.fft import fft2, fftshift, ifftshift
-import matplotlib.pyplot as plt 
 from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable
-from matplotlib.widgets import Slider
-import matplotlib.animation as animation
-#import datacube
-data = np.load('.npy_files/cuprite512.npy')
 
-#visualizing the datacube
-data_img = data[:,:,100]
 
-#step 1
-#computing photon shot noise
-num_photons = 500 #assumption
-#num_pixels = 256 #original
-num_pixels  = 512 #changed to fit datacube 
+@dataclass
+class DiagnosticSlice:
+    """Data captured for a single slice during simulation to aid plotting."""
 
-mu_p = num_photons * np.ones((num_pixels, num_pixels))
+    index: int
+    expected_photons: np.ndarray
+    shot_noise: np.ndarray
+    electrons: np.ndarray
+    electrons_out: np.ndarray
+    adu: np.ndarray
+    original_slice: np.ndarray
+    after_shot_noise: np.ndarray
+    after_electrons: np.ndarray
+    after_dark_noise: np.ndarray
 
-fig, ax = plt.subplots()
-img = ax.imshow(mu_p, vmin=400, vmax=600)
-image = ax.imshow(data_img)
 
-ax.set_xticks([])
-ax.set_yticks([])
-ax.set_title('No noise')
+def simulate_dark_noise(
+    data: np.ndarray,
+    num_photons: float = 500,
+    quantum_efficiency: float = 0.6,
+    dark_noise_std: float = 2.29,
+    sensitivity: float = 5.88,
+    bitdepth: int = 12,
+    seed: int | None = 42,
+    diagnostics_slice: int | None = None,
+    mask_threshold: float = 512,
+) -> tuple[np.ndarray, DiagnosticSlice | None]:
+    """Apply dark noise using the original simulator logic and return noisy datacube."""
+    rng = np.random.default_rng(seed)
 
-cb = plt.colorbar(img)
-cb.set_label('Photons')
+    input_dtype = data.dtype
+    original = data.astype(np.float32, copy=False)
 
-plt.show()
+    shot_noise = rng.poisson(num_photons, size=original.shape)
+    after_shot_noise = original.copy()
+    after_shot_noise[shot_noise > mask_threshold] = 0
 
-#add random poissonian process 
-#set seed so that we can reproducibly generate the same random numbers each time
-seed = 42
-#associate a randomState instance with that seed
-rs = np.random.RandomState(seed)
-#Using this RandomState instance, call the poisson method with a mean of num_photons and a size (num_pixels, num_pixels)
-shot_noise = rs.poisson(num_photons, (num_pixels, num_pixels))
+    electrons = np.round(quantum_efficiency * shot_noise)
+    after_electrons = after_shot_noise.copy()
+    after_electrons[electrons > mask_threshold] = 0
 
-affected_data = np.copy(data[:,:,100])
-dim = np.shape(affected_data)
-for i in range(0, dim[0]):
-  for j in range(0, dim[1]):
-    if shot_noise[i,j] > 512:
-      affected_data[i,j] = 0
+    electrons_out = np.round(
+        electrons + rng.normal(loc=0.0, scale=dark_noise_std, size=original.shape)
+    )
+    after_dark_noise = after_electrons.copy()
+    after_dark_noise[electrons_out > mask_threshold] = 0
 
-#plot the image and compare it to the one where no shot noise is present
-fig, (ax0, ax1) = plt.subplots(ncols=2)
-img0 = ax0.imshow(mu_p, vmin=400, vmax=600)
-image0 = ax0.imshow(data_img) #added
-ax0.set_xticks([])
-ax0.set_yticks([])
-ax0.set_title('No shot noise')
+    adu = np.round(electrons_out * sensitivity)
+    adu = np.clip(adu, 0, 2**bitdepth - 1)
 
-divider = make_axes_locatable(ax0)
-cax = divider.append_axes("right", size="5%", pad=0.05)
-cb0 = plt.colorbar(img0, cax=cax)
-cb0.set_ticks([])
+    # Clamp final noisy datacube to the original dtype range.
+    if np.issubdtype(input_dtype, np.integer):
+        info = np.iinfo(input_dtype)
+    else:
+        info = np.finfo(input_dtype)
+    noisy = np.clip(after_dark_noise, info.min, info.max).astype(input_dtype)
 
-img1 = ax1.imshow(shot_noise, vmin=400, vmax=600)
-image1 = ax1.imshow(affected_data) #added
-ax1.set_xticks([])
-ax1.set_yticks([])
-ax1.set_title('Shot noise')
+    diagnostics = None
+    if diagnostics_slice is not None:
+        slice_index = int(np.clip(diagnostics_slice, 0, data.shape[2] - 1))
+        diagnostics = DiagnosticSlice(
+            index=slice_index,
+            expected_photons=np.full(
+                data.shape[:2], num_photons, dtype=np.float32
+            ),
+            shot_noise=shot_noise[:, :, slice_index].astype(np.float32, copy=True),
+            electrons=electrons[:, :, slice_index].astype(np.float32, copy=True),
+            electrons_out=electrons_out[:, :, slice_index].astype(
+                np.float32, copy=True
+            ),
+            adu=adu[:, :, slice_index].astype(np.float32, copy=True),
+            original_slice=original[:, :, slice_index].copy(),
+            after_shot_noise=after_shot_noise[:, :, slice_index].copy(),
+            after_electrons=after_electrons[:, :, slice_index].copy(),
+            after_dark_noise=after_dark_noise[:, :, slice_index].copy(),
+        )
 
-divider = make_axes_locatable(ax1)
-cax = divider.append_axes("right", size="5%", pad=0.05)
-cb1 = plt.colorbar(img1, cax=cax)
-cb1.set_label('Photons')
+    return noisy, diagnostics
 
-plt.show()
 
-# distribution of photons hitting each pixel.
-plt.hist(shot_noise.ravel(), bins = np.arange(350, 650))
-plt.xlabel('Number of photons per pixel')
-plt.ylabel('Frequency')
-plt.show()
+def plot_slice(original: np.ndarray, noisy: np.ndarray, slice_index: int) -> None:
+    """Plot a before/after comparison for a single spectral slice."""
+    fig, (ax0, ax1) = plt.subplots(ncols=2, figsize=(10, 5))
 
-#step2
-#again, dont have certain values aside from quantum efficiency, assuming the rest
-#quantum_efficiency = 0.69
-quantum_efficiency = 0.6 #given = >60 ???
+    ax0.set_title("Original")
+    img0 = ax0.imshow(original[:, :, slice_index], cmap="gray")
+    ax0.set_xticks([])
+    ax0.set_yticks([])
+    divider0 = make_axes_locatable(ax0)
+    cax0 = divider0.append_axes("right", size="5%", pad=0.05)
+    fig.colorbar(img0, cax=cax0)
 
-# Round the result to ensure that we have a discrete number of electrons
-electrons = np.round(quantum_efficiency * shot_noise)
+    ax1.set_title("With Dark Noise")
+    img1 = ax1.imshow(noisy[:, :, slice_index], cmap="gray")
+    ax1.set_xticks([])
+    ax1.set_yticks([])
+    divider1 = make_axes_locatable(ax1)
+    cax1 = divider1.append_axes("right", size="5%", pad=0.05)
+    fig.colorbar(img1, cax=cax1)
 
-affected_data_2 = np.copy(affected_data)
-dim = np.shape(affected_data_2)
-for i in range(0, dim[0]):
-  for j in range(0, dim[1]):
-    if electrons[i,j] > 512:
-      affected_data_2[i,j] = 0
+    fig.tight_layout()
+    plt.show()
 
-fig, (ax0, ax1) = plt.subplots(ncols=2)
-img0 = ax0.imshow(shot_noise, vmin=200, vmax=600)
-image0 = ax0.imshow(affected_data) #added
-ax0.set_xticks([])
-ax0.set_yticks([])
-ax0.set_title('Photons')
 
-divider = make_axes_locatable(ax0)
-cax = divider.append_axes("right", size="5%", pad=0.05)
-cb0 = plt.colorbar(img0, cax=cax)
-cb0.set_ticks([])
+def plot_diagnostics(diag: DiagnosticSlice) -> None:
+    """Recreate the detailed diagnostic plots from the original simulator."""
 
-img1 = ax1.imshow(electrons, vmin=200, vmax=600)
-image1 = ax1.imshow(affected_data_2) #added
-ax1.set_xticks([])
-ax1.set_yticks([])
-ax1.set_title('Electrons')
+    def percentile_limits(arr: np.ndarray, low: float = 5, high: float = 95) -> tuple[float, float]:
+        vmin, vmax = np.percentile(arr, [low, high])
+        if np.isclose(vmin, vmax):
+            vmin = float(arr.min())
+            vmax = float(arr.max())
+            if np.isclose(vmin, vmax):
+                vmin -= 1.0
+                vmax += 1.0
+        return vmin, vmax
 
-divider = make_axes_locatable(ax1)
-cax = divider.append_axes("right", size="5%", pad=0.05)
-cb = plt.colorbar(img1, cax=cax)
+    fig, ax = plt.subplots()
+    vmin, vmax = percentile_limits(diag.expected_photons)
+    img = ax.imshow(diag.expected_photons, vmin=vmin, vmax=vmax, cmap="viridis")
+    ax.imshow(diag.original_slice, alpha=0.4, cmap="gray")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title("Expected Photons (No Noise)")
+    cb = plt.colorbar(img, ax=ax)
+    cb.set_label("Photons")
+    plt.show()
 
-plt.show()
+    fig, (ax0, ax1) = plt.subplots(ncols=2, figsize=(12, 5))
 
-#step3
-#calculate dark noise by modelling it as a Gaussian distribution whose standard deviation is equivalent to the dark noise spec of the camera
-dark_noise = 2.29 # electrons # also assumption - need exact spec
-electrons_out = np.round(rs.normal(scale=dark_noise, size=electrons.shape) + electrons)
+    vmin, vmax = percentile_limits(diag.expected_photons)
+    img0 = ax0.imshow(diag.expected_photons, vmin=vmin, vmax=vmax, cmap="viridis")
+    ax0.imshow(diag.original_slice, alpha=0.4, cmap="gray")
+    ax0.set_xticks([])
+    ax0.set_yticks([])
+    ax0.set_title("Expected Photons")
+    divider0 = make_axes_locatable(ax0)
+    cax0 = divider0.append_axes("right", size="5%", pad=0.05)
+    plt.colorbar(img0, cax=cax0)
 
-affected_data_3 = np.copy(affected_data_2)
-dim = np.shape(affected_data_3)
-for i in range(0, dim[0]):
-  for j in range(0, dim[1]):
-    if electrons_out[i,j] > 512:
-      affected_data_3[i,j] = 0
+    vmin, vmax = percentile_limits(diag.shot_noise)
+    img1 = ax1.imshow(diag.shot_noise, vmin=vmin, vmax=vmax, cmap="viridis")
+    ax1.imshow(diag.after_shot_noise, alpha=0.4, cmap="gray")
+    ax1.set_xticks([])
+    ax1.set_yticks([])
+    ax1.set_title("Shot Noise")
+    divider1 = make_axes_locatable(ax1)
+    cax1 = divider1.append_axes("right", size="5%", pad=0.05)
+    plt.colorbar(img1, cax=cax1)
 
-fig, (ax0, ax1) = plt.subplots(ncols=2)
-img0 = ax0.imshow(electrons, vmin=250, vmax=450)
-image0 = ax0.imshow(affected_data_2) #added
-ax0.set_xticks([])
-ax0.set_yticks([])
-ax0.set_title('Electrons In')
+    fig.tight_layout()
+    plt.show()
 
-divider = make_axes_locatable(ax0)
-cax = divider.append_axes("right", size="5%", pad=0.05)
-cb0 = plt.colorbar(img0, cax=cax)
-cb0.set_ticks([])
+    plt.figure()
+    plt.hist(diag.shot_noise.ravel(), bins=50)
+    plt.xlabel("Photons per pixel")
+    plt.ylabel("Frequency")
+    plt.title("Photon Shot Noise Distribution")
+    plt.show()
 
-img1 = ax1.imshow(electrons_out, vmin=250, vmax=450)
-image1 = ax1.imshow(affected_data_3) #added
-ax1.set_xticks([])
-ax1.set_yticks([])
-ax1.set_title('Electrons Out')
+    fig, (ax0, ax1) = plt.subplots(ncols=2, figsize=(12, 5))
 
-divider = make_axes_locatable(ax1)
-cax = divider.append_axes("right", size="5%", pad=0.05)
-cb = plt.colorbar(img1, cax=cax)
-cb.set_label('Electrons')
+    vmin, vmax = percentile_limits(diag.shot_noise)
+    img0 = ax0.imshow(diag.shot_noise, vmin=vmin, vmax=vmax)
+    ax0.imshow(diag.after_shot_noise, alpha=0.4, cmap="gray")
+    ax0.set_xticks([])
+    ax0.set_yticks([])
+    ax0.set_title("Photons After Shot Noise")
+    divider0 = make_axes_locatable(ax0)
+    cax0 = divider0.append_axes("right", size="5%", pad=0.05)
+    plt.colorbar(img0, cax=cax0)
 
-plt.show()
+    vmin, vmax = percentile_limits(diag.electrons)
+    img1 = ax1.imshow(diag.electrons, vmin=vmin, vmax=vmax)
+    ax1.imshow(diag.after_electrons, alpha=0.4, cmap="gray")
+    ax1.set_xticks([])
+    ax1.set_yticks([])
+    ax1.set_title("Electrons")
+    divider1 = make_axes_locatable(ax1)
+    cax1 = divider1.append_axes("right", size="5%", pad=0.05)
+    plt.colorbar(img1, cax=cax1)
 
-# Plot the difference between the two
-fig, ax = plt.subplots()
-img = ax.imshow(electrons - electrons_out, vmin=-10, vmax=10)
-ax.set_xticks([])
-ax.set_yticks([])
-ax.set_title('Difference')
+    fig.tight_layout()
+    plt.show()
 
-cb = plt.colorbar(img)
-cb.set_label('Electrons')
+    fig, (ax0, ax1) = plt.subplots(ncols=2, figsize=(12, 5))
 
-plt.show()
+    vmin, vmax = percentile_limits(diag.electrons)
+    img0 = ax0.imshow(diag.electrons, vmin=vmin, vmax=vmax)
+    ax0.imshow(diag.after_electrons, alpha=0.4, cmap="gray")
+    ax0.set_xticks([])
+    ax0.set_yticks([])
+    ax0.set_title("Electrons In")
+    divider0 = make_axes_locatable(ax0)
+    cax0 = divider0.append_axes("right", size="5%", pad=0.05)
+    plt.colorbar(img0, cax=cax0)
 
-#step 4
-#convert the value of each pixel from electrons to ADU
-sensitivity = 5.88 # ADU/e- #also assumption - need spec
-bitdepth = 12 #need exact spec
-# ensure that the final ADU count is discrete and to set the maximum upper value of ADU's to the 2k−1 where k is the camera's bit-depth
-max_adu = int(2**bitdepth - 1)
-#multiply the number of electrons after the addition of read noise by the sensitivity
-adu = (electrons_out * sensitivity).astype(int)
-adu[adu > max_adu] = max_adu # models pixel saturation
+    vmin, vmax = percentile_limits(diag.electrons_out)
+    img1 = ax1.imshow(diag.electrons_out, vmin=vmin, vmax=vmax)
+    ax1.imshow(diag.after_dark_noise, alpha=0.4, cmap="gray")
+    ax1.set_xticks([])
+    ax1.set_yticks([])
+    ax1.set_title("Electrons Out")
+    divider1 = make_axes_locatable(ax1)
+    cax1 = divider1.append_axes("right", size="5%", pad=0.05)
+    plt.colorbar(img1, cax=cax1)
 
-fig, ax = plt.subplots()
-img = ax.imshow(adu)
-ax.set_xticks([])
-ax.set_yticks([])
+    fig.tight_layout()
+    plt.show()
 
-cb = plt.colorbar(img)
-cb.set_label('ADU')
+    fig, ax = plt.subplots()
+    diff = diag.electrons_out - diag.electrons
+    vmin, vmax = percentile_limits(diff)
+    img = ax.imshow(diff, vmin=vmin, vmax=vmax)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title("Electron Difference (Out - In)")
+    cb = plt.colorbar(img, ax=ax)
+    cb.set_label("Electrons")
+    plt.show()
 
-plt.show()
+    fig, ax = plt.subplots()
+    vmin, vmax = percentile_limits(diag.adu)
+    img = ax.imshow(diag.adu, vmin=vmin, vmax=vmax, cmap="plasma")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title("Final ADU Map")
+    cb = plt.colorbar(img, ax=ax)
+    cb.set_label("ADU")
+    plt.show()
 
-# #step5
-# #add a baseline - prevents the number of ADU's from becoming negative at low input signal
-# baseline = 100 # ADU #should also be given by the camera model as well
-# adu += baseline
 
-# adu[adu > max_adu] = max_adu
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Simulate dark noise for a datacube.")
+    default_input = Path(__file__).resolve().parents[1] / "ksc512 (1).npy"
+    default_output = Path(__file__).resolve().parents[1] / "ksc512_dark_noise.npy"
 
-# fig, ax = plt.subplots()
-# img = ax.imshow(adu)
-# ax.set_xticks([])
-# ax.set_yticks([])
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=default_input,
+        help="Path to the input datacube (.npy).",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=default_output,
+        help="Path to write the noisy datacube (.npy).",
+    )
+    parser.add_argument(
+        "--slice",
+        type=int,
+        default=100,
+        help="Slice index to visualise after simulation.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used for noise generation.",
+    )
+    parser.add_argument(
+        "--bitdepth",
+        type=int,
+        default=12,
+        help="Sensor bit depth used when clipping ADU values.",
+    )
+    parser.add_argument(
+        "--quantum-efficiency",
+        type=float,
+        default=0.6,
+        help="Quantum efficiency of the sensor.",
+    )
+    parser.add_argument(
+        "--num-photons",
+        type=float,
+        default=500,
+        help="Mean photons per pixel used for the shot-noise model.",
+    )
+    parser.add_argument(
+        "--dark-noise-std",
+        type=float,
+        default=2.29,
+        help="Gaussian dark noise standard deviation in electrons.",
+    )
+    parser.add_argument(
+        "--sensitivity",
+        type=float,
+        default=5.88,
+        help="Conversion gain in ADU per electron.",
+    )
+    parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Disable plotting of the before/after slice comparison.",
+    )
+    parser.add_argument(
+        "--mask-threshold",
+        type=float,
+        default=512,
+        help="Threshold applied after each stage to zero affected pixels.",
+    )
+    return parser
 
-# cb = plt.colorbar(img)
-# cb.set_label('ADU')
 
-# plt.show()
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    data = np.load(args.input)
+    noisy_data, diagnostics = simulate_dark_noise(
+        data,
+        num_photons=args.num_photons,
+        quantum_efficiency=args.quantum_efficiency,
+        dark_noise_std=args.dark_noise_std,
+        sensitivity=args.sensitivity,
+        bitdepth=args.bitdepth,
+        seed=args.seed,
+        diagnostics_slice=args.slice,
+        mask_threshold=args.mask_threshold,
+    )
+
+    np.save(args.output, noisy_data)
+    print(f"Saved noisy datacube to {args.output}")
+
+    if not args.no_plot:
+        slice_index = diagnostics.index if diagnostics else int(
+            np.clip(args.slice, 0, noisy_data.shape[2] - 1)
+        )
+        plot_slice(data, noisy_data, slice_index)
+        if diagnostics:
+            plot_diagnostics(diagnostics)
+
+
+if __name__ == "__main__":
+    main()
